@@ -1,0 +1,11 @@
+{
+  "rules": {
+    "vehicles": {
+      "$deviceId": {
+        ".read": true,
+        ".write": "auth != null"
+      }
+    }
+  }
+}
+
