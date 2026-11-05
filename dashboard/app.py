@@ -55,28 +55,32 @@ def get_vehicle_serial():
 vehicle_serial = get_vehicle_serial()
 vehicle_sensor_connected = vehicle_serial is not None
 
-# Thread-safe OpenStreetMap Overpass Speed Limit Cache
+# Thread-safe OpenStreetMap Overpass Speed Limit & Reverse Geocoding Cache
 speed_limit_cache: Dict[str, Any] = {
     "last_lat": None,
     "last_lng": None,
     "last_query_time": 0.0,
     "current_road": None,
+    "current_area": None,
+    "current_city": None,
+    "full_location": None,
     "speed_limit": None,
     "query_in_progress": False
 }
 
 
 def query_osm_speed_limit_async(lat: float, lng: float) -> None:
-    """Queries OpenStreetMap Overpass API for road speed limit in a background daemon thread."""
+    """Queries OpenStreetMap Nominatim for Reverse Geocoding (Road, Area, City)
+    and Overpass API for applicable road speed limit in a background daemon thread."""
     now = time.time()
     if speed_limit_cache["query_in_progress"]:
         return
 
-    # Rate limiting: only query every 30s or when moved > 50m
-    if (now - speed_limit_cache["last_query_time"]) < getattr(config, "SPEED_LIMIT_CACHE_TTL_SEC", 30.0):
+    # Rate limiting: only query every 20s or when moved > 30m
+    if (now - speed_limit_cache["last_query_time"]) < getattr(config, "SPEED_LIMIT_CACHE_TTL_SEC", 20.0):
         if speed_limit_cache["last_lat"] is not None:
             dist_m = (((lat - speed_limit_cache["last_lat"])**2 + (lng - speed_limit_cache["last_lng"])**2)**0.5) * 111000.0
-            if dist_m < getattr(config, "SPEED_LIMIT_MIN_DISTANCE_M", 50.0):
+            if dist_m < getattr(config, "SPEED_LIMIT_MIN_DISTANCE_M", 30.0):
                 return
 
     speed_limit_cache["query_in_progress"] = True
@@ -86,28 +90,68 @@ def query_osm_speed_limit_async(lat: float, lng: float) -> None:
 
     def worker():
         try:
+            # 1. Reverse Geocoding via OpenStreetMap Nominatim (Free, no API key needed)
+            nom_url = "https://nominatim.openstreetmap.org/reverse"
+            headers = {"User-Agent": "DriverDrowsinessMonitor/1.0 (Student Major Project)"}
+            params = {
+                "format": "json",
+                "lat": lat,
+                "lon": lng,
+                "zoom": 18,
+                "addressdetails": 1
+            }
+            resp_geo = requests.get(nom_url, params=params, headers=headers, timeout=3.5)
+            if resp_geo.status_code == 200:
+                geo_data = resp_geo.json()
+                addr = geo_data.get("address", {})
+                road = addr.get("road") or addr.get("pedestrian") or addr.get("street") or ""
+                area = addr.get("suburb") or addr.get("neighbourhood") or addr.get("residential") or addr.get("quarter") or ""
+                city = addr.get("city") or addr.get("town") or addr.get("county") or ""
+                
+                parts = [p for p in [road, area, city] if p]
+                loc_summary = ", ".join(parts) if parts else "Identified Roadway"
+                
+                speed_limit_cache["current_road"] = road or "Identified Roadway"
+                speed_limit_cache["current_area"] = area
+                speed_limit_cache["current_city"] = city
+                speed_limit_cache["full_location"] = loc_summary
+
+            # 2. Query Speed Limit via Overpass API
             url = getattr(config, "OVERPASS_API_URL", "https://overpass-api.de/api/interpreter")
-            timeout_sec = getattr(config, "SPEED_LIMIT_TIMEOUT_SEC", 2.0)
-            overpass_query = f"""[out:json][timeout:2];way(around:45,{lat},{lng})["highway"]["maxspeed"];out tags 1;"""
+            timeout_sec = getattr(config, "SPEED_LIMIT_TIMEOUT_SEC", 2.5)
+            overpass_query = f"""[out:json][timeout:3];way(around:60,{lat},{lng})["highway"];out tags 3;"""
             resp = requests.post(url, data={"data": overpass_query}, timeout=timeout_sec)
+            
+            speed_val = None
             if resp.status_code == 200:
                 data = resp.json()
                 elements = data.get("elements", [])
-                if elements and "tags" in elements[0]:
-                    tags = elements[0]["tags"]
+                for el in elements:
+                    tags = el.get("tags", {})
+                    # Check for explicit maxspeed tag
                     raw_maxspeed = tags.get("maxspeed", "")
-                    road_name = tags.get("name", "Identified Roadway")
-                    tokens = raw_maxspeed.split()
-                    if tokens:
-                        val = float(tokens[0])
-                        if "mph" in raw_maxspeed.lower():
-                            val *= 1.60934
-                        speed_limit_cache["speed_limit"] = int(round(val))
-                        speed_limit_cache["current_road"] = road_name
-                        return
-            speed_limit_cache["speed_limit"] = None
+                    if raw_maxspeed:
+                        tokens = raw_maxspeed.split()
+                        if tokens and tokens[0].isdigit():
+                            val = float(tokens[0])
+                            if "mph" in raw_maxspeed.lower():
+                                val *= 1.60934
+                            speed_val = int(round(val))
+                            break
+                    # Contextual speed limit based on standard road category
+                    hwy_type = tags.get("highway", "")
+                    if speed_val is None:
+                        if hwy_type in ["motorway", "trunk"]:
+                            speed_val = 80
+                        elif hwy_type in ["primary", "secondary"]:
+                            speed_val = 50
+                        elif hwy_type in ["tertiary", "residential", "living_street", "service"]:
+                            speed_val = 30
+
+            speed_limit_cache["speed_limit"] = speed_val
+
         except Exception:
-            speed_limit_cache["speed_limit"] = None
+            pass
         finally:
             speed_limit_cache["query_in_progress"] = False
 
@@ -327,8 +371,8 @@ def read_vehicle_sensor() -> Dict[str, Any]:
                         if fix_valid:
                             query_osm_speed_limit_async(lat, lng)
 
-                        curr_limit = speed_limit_cache["speed_limit"]
-                        curr_road = speed_limit_cache["current_road"]
+                        curr_limit = speed_limit_cache.get("speed_limit")
+                        curr_road = speed_limit_cache.get("full_location") or speed_limit_cache.get("current_road") or "Identified Roadway"
 
                         vehicle_telemetry["raw_gps_speed"] = speed
                         if fix_valid and speed > 1.0:
@@ -1364,14 +1408,14 @@ if st.session_state.monitoring_active:
                     lat_val = vehicle_telemetry["latitude"]
                     lng_val = vehicle_telemetry["longitude"]
                     sats_cnt = vehicle_telemetry["satellites"]
-                    road_txt = vehicle_telemetry["current_road"] or "Road Identified"
+                    road_txt = vehicle_telemetry.get("current_road") or "Road Identified"
                     gps_coords_ph.markdown(
                         render_metric_card(
                             "GPS Position",
                             f"{lat_val:.5f}, {lng_val:.5f}",
                             status_badge=f"{sats_cnt} Sats (3D Fix)",
                             badge_type="nominal",
-                            sub_text=f"Road: {road_txt}"
+                            sub_text=f"📍 {road_txt}"
                         ),
                         unsafe_allow_html=True
                     )
@@ -1407,9 +1451,9 @@ if st.session_state.monitoring_active:
                             "Road Speed Limit",
                             f"{vehicle_telemetry['speed_limit']}",
                             unit="km/h",
-                            status_badge="OSM VERIFIED",
+                            status_badge="OSM LIMIT",
                             badge_type="nominal",
-                            sub_text=f"Road: {vehicle_telemetry['current_road'] or 'Matched'}"
+                            sub_text=f"📍 {vehicle_telemetry.get('current_road') or 'Matched Roadway'}"
                         ),
                         unsafe_allow_html=True
                     )
@@ -1420,7 +1464,7 @@ if st.session_state.monitoring_active:
                             "SPEED LIMIT UNAVAILABLE",
                             status_badge="NO DATA",
                             badge_type="standby",
-                            sub_text="OpenStreetMap Overpass Lookup"
+                            sub_text=f"📍 {vehicle_telemetry.get('current_road') or 'OpenStreetMap Lookup'}"
                         ),
                         unsafe_allow_html=True
                     )

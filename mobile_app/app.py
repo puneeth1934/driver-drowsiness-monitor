@@ -419,7 +419,7 @@ def render_live_telemetry():
             <div style="font-size: 0.85rem; font-weight: 700; color: #f8fafc; margin-top: 2px;">
                 {f'{lat:.5f}, {lng:.5f}' if fix_valid else 'Awaiting Sky Line-of-Sight'}
             </div>
-            <div style="font-size: 0.7rem; color: #64748b; margin-top: 2px;">Road: {road_name}</div>
+            <div style="font-size: 0.74rem; color: #38bdf8; margin-top: 3px; font-weight: 600;">📍 {road_name}</div>
         </div>
         """,
         unsafe_allow_html=True
